@@ -1,4 +1,4 @@
-# README.md（直接复制到你的项目根目录）
+# README.md
 
 ```markdown
 # im-chat-server
