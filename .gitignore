@@ -13,3 +13,4 @@
 # IDE编辑器配置目录
 .idea/
 .vscode/
+server/im.db
