@@ -10,14 +10,12 @@ import (
 	"strings"
 )
 
-// Encode 编码：4字节大端长度头 + 消息体
 func Encode(body []byte) []byte {
 	header := make([]byte, 4)
 	binary.BigEndian.PutUint32(header, uint32(len(body)))
 	return append(header, body...)
 }
 
-// Decode 解码：读取完整数据包，自动处理粘包拆包
 func Decode(r io.Reader) ([]byte, error) {
 	headerBuf := make([]byte, 4)
 	_, err := io.ReadFull(r, headerBuf)
@@ -41,25 +39,19 @@ func main() {
 	}
 	defer conn.Close()
 	fmt.Println("✅ 成功连接IM服务")
-
 	reader := bufio.NewReader(os.Stdin)
-
-	// 认证循环，失败可重试
+	// 认证
 	for {
 		fmt.Println("请选择：1注册账号  2登录账号")
 		fmt.Print("输入选择(1/2) > ")
 		choice, _ := reader.ReadString('\n')
 		choice = strings.TrimSpace(choice)
-
 		fmt.Print("用户名 > ")
 		user, _ := reader.ReadString('\n')
 		user = strings.TrimSpace(user)
-
 		fmt.Print("密码 > ")
 		pass, _ := reader.ReadString('\n')
 		pass = strings.TrimSpace(pass)
-
-		// 把1/2转为 register / login
 		var action string
 		if choice == "1" {
 			action = "register"
@@ -69,42 +61,46 @@ func main() {
 			fmt.Println("❌ 只能输入1或者2")
 			continue
 		}
-
 		cmd := fmt.Sprintf("%s|%s|%s", action, user, pass)
 		_, err = conn.Write(Encode([]byte(cmd)))
 		if err != nil {
 			fmt.Println("发送失败", err)
 			return
 		}
-
 		respBody, err := Decode(conn)
 		if err != nil {
-			fmt.Printf("读取服务响应失败：%v\n", err)
+			fmt.Printf("读取响应失败：%v\n", err)
 			continue
 		}
 		respMsg := string(respBody)
 		fmt.Println(respMsg)
-
-		// ========== 修改判断：注册成功 或者 登录成功，都跳出循环 ==========
 		if strings.Contains(respMsg, "注册成功") || strings.Contains(respMsg, "登录成功") {
 			break
 		}
 	}
-
-	// 接收消息协程
+	// 接收协程
 	go func() {
 		for {
 			body, err := Decode(conn)
 			if err != nil {
-				fmt.Println("\n⚠️ 服务端连接断开")
+				fmt.Println("\n⚠️ 连接断开")
 				os.Exit(0)
 			}
 			fmt.Printf("%s\n", string(body))
 		}
 	}()
 
-	// 聊天输入循环
-	fmt.Println("=== 开始聊天，输入文字回车发送 ===")
+	fmt.Println("\n=====聊天开始=====")
+	fmt.Println("指令：")
+	fmt.Println("addfriend|xxx        添加好友xxx")
+	fmt.Println("pendinglist          查看收到的好友申请")
+	fmt.Println("acceptfriend|xxx     同意好友申请")
+	fmt.Println("rejectfriend|xxx     拒绝好友申请")
+	fmt.Println("friendlist           查看好友列表")
+	fmt.Println("delfriend|xxx        删除好友")
+	fmt.Println("@xxx 消息内容        私聊好友（离线自动存消息）")
+	fmt.Println("直接打字 = 公共广播")
+	fmt.Println("======================")
 	chatReader := bufio.NewReader(os.Stdin)
 	for {
 		text, _ := chatReader.ReadString('\n')
