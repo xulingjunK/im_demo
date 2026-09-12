@@ -1,4 +1,4 @@
-# im-chat-server
+# IM-CHAT-SERVER
 
 ```markdown
 # im-chat-server
