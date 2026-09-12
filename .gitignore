@@ -1,0 +1,15 @@
+# Go依赖目录
+/vendor/
+# 日志文件
+*.log
+
+# sqlite数据库文件
+*.db
+*.sqlite
+
+# 编译生成的二进制程序
+*.exe
+
+# IDE编辑器配置目录
+.idea/
+.vscode/
