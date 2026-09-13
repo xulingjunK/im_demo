@@ -9,15 +9,27 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
+const (
+	heartbeatTimeout = 10 * time.Second // 10秒无数据则踢下线
+	scanInterval     = 2 * time.Second  // 多久扫描一次连接
+)
+
+type ClientSession struct {
+	conn         net.Conn
+	username     string
+	lastActiveAt time.Time
+}
+
 var (
-	clients = make(map[net.Conn]string) // conn -> username
-	mu      sync.Mutex
-	db      *sql.DB
+	sessions = make(map[net.Conn]*ClientSession)
+	mu       sync.Mutex
+	db       *sql.DB
 )
 
 func Encode(body []byte) []byte {
@@ -25,7 +37,12 @@ func Encode(body []byte) []byte {
 	binary.BigEndian.PutUint32(header, uint32(len(body)))
 	return append(header, body...)
 }
-func Decode(r io.Reader) ([]byte, error) {
+
+// 【修改】增加读超时参数，解决半开连接永久阻塞
+func Decode(r io.Reader, timeout time.Duration) ([]byte, error) {
+	if conn, ok := r.(net.Conn); ok {
+		conn.SetReadDeadline(time.Now().Add(timeout))
+	}
 	headerBuf := make([]byte, 4)
 	_, err := io.ReadFull(r, headerBuf)
 	if err != nil {
@@ -39,6 +56,31 @@ func Decode(r io.Reader) ([]byte, error) {
 	_, err = io.ReadFull(r, bodyBuf)
 	return bodyBuf, err
 }
+
+// 【修改】心跳检测增加写超时，防止Write阻塞
+func startHeartbeatChecker() {
+	ticker := time.NewTicker(scanInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		mu.Lock()
+		var toClose []net.Conn
+		now := time.Now()
+		for _, sess := range sessions {
+			if now.Sub(sess.lastActiveAt) > heartbeatTimeout {
+				toClose = append(toClose, sess.conn)
+			}
+		}
+		mu.Unlock()
+
+		for _, c := range toClose {
+			log.Println("⚠️ 连接心跳超时，关闭", c.RemoteAddr())
+			_ = c.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			_, _ = c.Write(Encode([]byte("⚠️ 心跳超时，连接断开")))
+			_ = c.Close()
+		}
+	}
+}
+
 func initDB() error {
 	var err error
 	db, err = sql.Open("sqlite", "./im.db")
@@ -48,41 +90,42 @@ func initDB() error {
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	createSQL := `
-	CREATE TABLE IF NOT EXISTS users (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		username TEXT UNIQUE NOT NULL,
-		password TEXT NOT NULL
-	);
-	-- 已确认双向好友
-	CREATE TABLE IF NOT EXISTS friends (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		userA TEXT NOT NULL,
-		userB TEXT NOT NULL,
-		UNIQUE(userA,userB)
-	);
-	-- 待处理好友申请
-	CREATE TABLE IF NOT EXISTS pending_friend (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		fromUser TEXT NOT NULL,
-		toUser TEXT NOT NULL,
-		createTime DATETIME DEFAULT CURRENT_TIMESTAMP,
-		UNIQUE(fromUser,toUser)
-	);
-	-- 离线私聊消息
-	CREATE TABLE IF NOT EXISTS offline_msg (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		sender TEXT NOT NULL,
-		receiver TEXT NOT NULL,
-		content TEXT NOT NULL,
-		createTime DATETIME DEFAULT CURRENT_TIMESTAMP
-	);`
+CREATE TABLE IF NOT EXISTS users (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	username TEXT UNIQUE NOT NULL,
+	password TEXT NOT NULL,
+	security_question TEXT,
+	security_answer TEXT
+);
+CREATE TABLE IF NOT EXISTS friends (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	userA TEXT NOT NULL,
+	userB TEXT NOT NULL,
+	UNIQUE(userA,userB)
+);
+CREATE TABLE IF NOT EXISTS pending_friend (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	fromUser TEXT NOT NULL,
+	toUser TEXT NOT NULL,
+	createTime DATETIME DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(fromUser,toUser)
+);
+CREATE TABLE IF NOT EXISTS offline_msg (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	sender TEXT NOT NULL,
+	receiver TEXT NOT NULL,
+	content TEXT NOT NULL,
+	createTime DATETIME DEFAULT CURRENT_TIMESTAMP
+);`
 	_, err = db.Exec(createSQL)
 	return err
 }
+
 func hashPassword(pwd string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
 	return string(hash), err
 }
+
 func checkPassword(username, pwd string) (bool, error) {
 	var hashPwd string
 	row := db.QueryRow("SELECT password FROM users WHERE username=?", username)
@@ -99,6 +142,7 @@ func checkPassword(username, pwd string) (bool, error) {
 	}
 	return true, nil
 }
+
 func registerUser(username, pwd string) error {
 	hash, err := hashPassword(pwd)
 	if err != nil {
@@ -108,19 +152,68 @@ func registerUser(username, pwd string) error {
 	return err
 }
 
-// 获取在线连接
+func setSecurityQuestion(username, question, answer string) error {
+	ansHash, err := bcrypt.GenerateFromPassword([]byte(answer), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`UPDATE users SET security_question=?, security_answer=? WHERE username=?`,
+		question, string(ansHash), username)
+	return err
+}
+
+func getSecurityQuestion(username string) (string, error) {
+	var q string
+	row := db.QueryRow(`SELECT security_question FROM users WHERE username=?`, username)
+	err := row.Scan(&q)
+	if err != nil {
+		return "", err
+	}
+	return q, nil
+}
+
+func resetPasswordBySecAnswer(username, answer, newPwd string) (string, error) {
+	var ansHash string
+	row := db.QueryRow(`SELECT security_answer FROM users WHERE username=?`, username)
+	err := row.Scan(&ansHash)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "❌ 用户不存在", nil
+		}
+		return "", err
+	}
+	if ansHash == "" {
+		return "❌ 该用户未设置密保，无法找回", nil
+	}
+	err = bcrypt.CompareHashAndPassword([]byte(ansHash), []byte(answer))
+	if err != nil {
+		return "❌ 密保答案错误", nil
+	}
+	if len(newPwd) < 3 {
+		return "❌ 新密码至少3位", nil
+	}
+	newHash, err := hashPassword(newPwd)
+	if err != nil {
+		return "", err
+	}
+	_, err = db.Exec(`UPDATE users SET password=? WHERE username=?`, newHash, username)
+	if err != nil {
+		return "", err
+	}
+	return "✅ 密码重置成功，请使用新密码登录", nil
+}
+
 func getOnlineConn(targetName string) net.Conn {
 	mu.Lock()
 	defer mu.Unlock()
-	for c, un := range clients {
-		if un == targetName {
-			return c
+	for _, sess := range sessions {
+		if sess.username == targetName {
+			return sess.conn
 		}
 	}
 	return nil
 }
 
-// 发送系统消息给指定用户
 func sendSysMsg(username string, msg string) {
 	conn := getOnlineConn(username)
 	if conn != nil {
@@ -128,7 +221,6 @@ func sendSysMsg(username string, msg string) {
 	}
 }
 
-// 添加好友申请
 func addFriendApply(fromUser, toUser string) (string, error) {
 	var exist int
 	err := db.QueryRow("SELECT count(*) FROM users WHERE username=?", toUser).Scan(&exist)
@@ -141,7 +233,6 @@ func addFriendApply(fromUser, toUser string) (string, error) {
 	if fromUser == toUser {
 		return "❌ 不能添加自己", nil
 	}
-	// 已经是好友？
 	var isAlready int
 	err = db.QueryRow(`SELECT count(*) FROM friends WHERE (userA=? AND userB=?) OR (userA=? AND userB=?)`,
 		fromUser, toUser, toUser, fromUser).Scan(&isAlready)
@@ -151,23 +242,19 @@ func addFriendApply(fromUser, toUser string) (string, error) {
 	if isAlready > 0 {
 		return "❌ 你们已经是好友", nil
 	}
-	// 插入待申请
 	_, err = db.Exec("INSERT OR IGNORE INTO pending_friend(fromUser,toUser) VALUES (?,?)", fromUser, toUser)
 	if err != nil {
 		return "", err
 	}
-	// 推送通知给对方
 	sendSysMsg(toUser, fmt.Sprintf("📩 收到好友申请：【%s】想加你好友，输入 pendinglist 查看", fromUser))
 	return fmt.Sprintf("✅ 成功向【%s】发送好友申请", toUser), nil
 }
 
-// 同意好友申请
 func acceptFriend(acceptUser, applyUser string) (string, error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return "", err
 	}
-	// 删除pending记录
 	res, err := tx.Exec(`DELETE FROM pending_friend WHERE fromUser=? AND toUser=?`, applyUser, acceptUser)
 	if err != nil {
 		tx.Rollback()
@@ -178,7 +265,6 @@ func acceptFriend(acceptUser, applyUser string) (string, error) {
 		tx.Rollback()
 		return "❌ 没有这条好友申请", nil
 	}
-	// 双向好友
 	_, err = tx.Exec(`INSERT INTO friends(userA,userB) VALUES (?,?)`, applyUser, acceptUser)
 	if err != nil {
 		tx.Rollback()
@@ -197,7 +283,6 @@ func acceptFriend(acceptUser, applyUser string) (string, error) {
 	return fmt.Sprintf("✅ 成功添加【%s】为好友", applyUser), nil
 }
 
-// 拒绝好友申请
 func rejectFriend(acceptUser, applyUser string) (string, error) {
 	res, err := db.Exec(`DELETE FROM pending_friend WHERE fromUser=? AND toUser=?`, applyUser, acceptUser)
 	if err != nil {
@@ -211,7 +296,6 @@ func rejectFriend(acceptUser, applyUser string) (string, error) {
 	return fmt.Sprintf("✅ 已拒绝【%s】的好友申请", applyUser), nil
 }
 
-// 删除好友
 func delFriend(userA, userB string) (string, error) {
 	tx, err := db.Begin()
 	if err != nil {
@@ -231,7 +315,6 @@ func delFriend(userA, userB string) (string, error) {
 	return fmt.Sprintf("✅ 已删除好友【%s】", userB), nil
 }
 
-// 获取好友列表
 func getFriendList(username string) ([]string, error) {
 	rows, err := db.Query(`SELECT userB FROM friends WHERE userA=?`, username)
 	if err != nil {
@@ -250,7 +333,6 @@ func getFriendList(username string) ([]string, error) {
 	return list, nil
 }
 
-// 获取收到的待处理申请
 func getPendingList(username string) ([]string, error) {
 	rows, err := db.Query(`SELECT fromUser FROM pending_friend WHERE toUser=?`, username)
 	if err != nil {
@@ -269,7 +351,6 @@ func getPendingList(username string) ([]string, error) {
 	return list, nil
 }
 
-// 判断是否好友【修复】
 func isFriend(u1, u2 string) (bool, error) {
 	var cnt int
 	err := db.QueryRow(`SELECT count(*) FROM friends WHERE (userA=? AND userB=?) OR (userA=? AND userB=?)`,
@@ -280,13 +361,11 @@ func isFriend(u1, u2 string) (bool, error) {
 	return cnt > 0, nil
 }
 
-// 保存离线消息
 func saveOfflineMsg(sender, receiver, content string) error {
 	_, err := db.Exec(`INSERT INTO offline_msg(sender,receiver,content) VALUES (?,?,?)`, sender, receiver, content)
 	return err
 }
 
-// 读取并清空离线消息（用户上线调用）
 func fetchOfflineMsg(username string) ([]string, error) {
 	rows, err := db.Query(`SELECT sender,content,createTime FROM offline_msg WHERE receiver=?`, username)
 	if err != nil {
@@ -302,12 +381,11 @@ func fetchOfflineMsg(username string) ([]string, error) {
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
-	// 读完删除
 	_, err = db.Exec(`DELETE FROM offline_msg WHERE receiver=?`, username)
 	return msgs, err
 }
+
 func startChatLoop(conn net.Conn, username string) {
-	// 用户上线，推送离线消息
 	offlineMsgs, err := fetchOfflineMsg(username)
 	if err == nil && len(offlineMsgs) > 0 {
 		for _, m := range offlineMsgs {
@@ -315,17 +393,28 @@ func startChatLoop(conn net.Conn, username string) {
 		}
 	}
 	for {
-		body, err := Decode(conn)
+		// 【修改】传入读超时
+		body, err := Decode(conn, heartbeatTimeout)
 		if err != nil {
 			log.Println(username, "读取消息失败：", err)
 			return
 		}
 		content := strings.TrimSpace(string(body))
+		// 收到任何数据都更新活跃时间
+		mu.Lock()
+		if sess, ok := sessions[conn]; ok {
+			sess.lastActiveAt = time.Now()
+		}
+		mu.Unlock()
+
 		if content == "" {
 			continue
 		}
 		var resp string
 		switch {
+		case content == "ping":
+			_, _ = conn.Write(Encode([]byte("pong")))
+			continue
 		case strings.HasPrefix(content, "addfriend|"):
 			parts := strings.Split(content, "|")
 			if len(parts) != 2 {
@@ -404,6 +493,20 @@ func startChatLoop(conn net.Conn, username string) {
 			}
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
+		case strings.HasPrefix(content, "setsecq|"):
+			parts := strings.Split(content, "|")
+			if len(parts) != 3 {
+				resp = "❌ 格式 setsecq|密保问题|密保答案"
+			} else {
+				err := setSecurityQuestion(username, parts[1], parts[2])
+				if err != nil {
+					resp = "❌ 设置密保失败"
+				} else {
+					resp = "✅ 密保设置成功！请牢记你的密保答案"
+				}
+			}
+			_, _ = conn.Write(Encode([]byte(resp)))
+			continue
 		case strings.HasPrefix(content, "@"):
 			rest := content[1:]
 			spaceIdx := strings.Index(rest, " ")
@@ -424,7 +527,6 @@ func startChatLoop(conn net.Conn, username string) {
 			privateMsg := fmt.Sprintf("【私聊 %s->%s】%s", username, targetName, chatMsg)
 			log.Println(privateMsg)
 			if targetConn == nil {
-				// 离线，存入离线消息
 				err := saveOfflineMsg(username, targetName, chatMsg)
 				if err != nil {
 					resp = "❌ 保存离线消息失败"
@@ -442,12 +544,11 @@ func startChatLoop(conn net.Conn, username string) {
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
 		}
-		// 公共广播消息
 		msg := fmt.Sprintf("【公共】【%s】: %s", username, content)
 		log.Println("公共消息：", msg)
 		mu.Lock()
 		var conns []net.Conn
-		for c := range clients {
+		for c := range sessions {
 			conns = append(conns, c)
 		}
 		mu.Unlock()
@@ -460,40 +561,88 @@ func startChatLoop(conn net.Conn, username string) {
 		}
 	}
 }
+
 func handleConn(conn net.Conn) {
+	mu.Lock()
+	sess := &ClientSession{
+		conn:         conn,
+		username:     "",
+		lastActiveAt: time.Now(),
+	}
+	sessions[conn] = sess
+	mu.Unlock()
+
 	defer func() {
 		mu.Lock()
-		delete(clients, conn)
+		delete(sessions, conn)
 		mu.Unlock()
 		conn.Close()
 		log.Println("客户端断开：", conn.RemoteAddr())
 	}()
+
 	for {
-		body, err := Decode(conn)
+		// 【修改】传入读超时
+		body, err := Decode(conn, heartbeatTimeout)
 		if err != nil {
 			log.Println("读取认证失败", err)
 			return
 		}
 		raw := strings.TrimSpace(string(body))
+		// 认证阶段也要更新心跳时间
+		mu.Lock()
+		sess.lastActiveAt = time.Now()
+		mu.Unlock()
+
 		parts := strings.Split(raw, "|")
+		var resp string
+		if len(parts) >= 1 {
+			switch parts[0] {
+			case "getsecq":
+				if len(parts) != 2 {
+					resp = "❌ 格式 getsecq|用户名"
+				} else {
+					q, err := getSecurityQuestion(parts[1])
+					if err != nil {
+						resp = "❌ 查询失败，用户不存在或未设置密保"
+					} else {
+						resp = fmt.Sprintf("❓密保问题：%s", q)
+					}
+				}
+				_, _ = conn.Write(Encode([]byte(resp)))
+				continue
+			case "resetpwd":
+				if len(parts) != 4 {
+					resp = "❌ 格式 resetpwd|用户名|密保答案|新密码"
+				} else {
+					msg, err := resetPasswordBySecAnswer(parts[1], parts[2], parts[3])
+					if err != nil {
+						resp = "❌ 重置失败，数据库异常"
+					} else {
+						resp = msg
+					}
+				}
+				_, _ = conn.Write(Encode([]byte(resp)))
+				continue
+			}
+		}
 		if len(parts) != 3 {
-			resp := "❌ 格式：register|user|pass 或 login|user|pass"
+			resp = "❌ 格式：register|user|pass 或 login|user|pass，找回密码可用 getsecq|xxx / resetpwd|user|答案|新密码"
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
 		}
 		action, username, pwd := parts[0], parts[1], parts[2]
 		if strings.Contains(username, " ") {
-			resp := "❌ 用户名不能带空格"
+			resp = "❌ 用户名不能带空格"
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
 		}
 		if username == "" || pwd == "" {
-			resp := "❌ 用户名密码不能为空"
+			resp = "❌ 用户名密码不能为空"
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
 		}
 		if len(pwd) < 3 {
-			resp := "❌ 密码至少3位"
+			resp = "❌ 密码至少3位"
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
 		}
@@ -501,44 +650,62 @@ func handleConn(conn net.Conn) {
 		if action == "register" {
 			err := registerUser(username, pwd)
 			if err != nil {
-				resp := "❌ 注册失败，用户名已存在"
+				resp = "❌ 注册失败，用户名已存在"
 				_, _ = conn.Write(Encode([]byte(resp)))
 				continue
 			}
-			resp := "✅ 注册成功，自动登录"
+			resp = "✅ 注册成功，自动登录"
 			_, _ = conn.Write(Encode([]byte(resp)))
 			loginSuccess = true
 		} else if action == "login" {
 			ok, err := checkPassword(username, pwd)
 			if err != nil {
-				resp := "❌ 服务内部错误"
+				resp = "❌ 服务内部错误"
 				_, _ = conn.Write(Encode([]byte(resp)))
 				continue
 			}
 			if !ok {
-				resp := "❌ 用户或密码错误"
+				resp = "❌ 用户或密码错误"
 				_, _ = conn.Write(Encode([]byte(resp)))
 				continue
 			}
 			loginSuccess = true
 		} else {
-			resp := "❌ 只能 register / login"
+			resp = "❌ 只能 register / login"
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
 		}
 		if loginSuccess {
 			mu.Lock()
-			clients[conn] = username
+			// 【修改】单点登录踢旧连接，全部操作放锁内
+			var oldConn net.Conn
+			for c, s := range sessions {
+				if s.username == username {
+					oldConn = c
+					delete(sessions, c)
+					break
+				}
+			}
+			if oldConn != nil {
+				_ = oldConn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+				_, _ = oldConn.Write(Encode([]byte("⚠️你的账号在其他设备登录，你已被踢下线！")))
+				_ = oldConn.Close()
+				log.Printf("【%s】旧连接被踢下线", username)
+			}
+			sess.username = username
+			sessions[conn] = sess
 			mu.Unlock()
+
 			helpText := `✅登录成功！
 指令列表：
-addfriend|xxx        添加好友xxx
-pendinglist          查看收到的好友申请
-acceptfriend|xxx     同意好友申请
-rejectfriend|xxx     拒绝好友申请
-friendlist           查看好友列表
-delfriend|xxx        删除好友
-@xxx 消息内容        私聊好友
+addfriend|xxx     添加好友xxx
+pendinglist       查看收到的好友申请
+acceptfriend|xxx  同意好友申请
+rejectfriend|xxx  拒绝好友申请
+friendlist        查看好友列表
+delfriend|xxx     删除好友
+setsecq|问题|答案 设置密保问题（用于找回密码）
+@xxx 消息内容     私聊好友
 直接输入文字 = 公共频道`
 			_, _ = conn.Write(Encode([]byte(helpText)))
 			log.Printf("【%s】上线 %s", username, conn.RemoteAddr())
@@ -547,6 +714,7 @@ delfriend|xxx        删除好友
 		}
 	}
 }
+
 func main() {
 	err := initDB()
 	if err != nil {
@@ -554,6 +722,8 @@ func main() {
 	}
 	defer db.Close()
 	log.Println("✅ SQLite IM数据库加载成功")
+	go startHeartbeatChecker()
+
 	listener, err := net.Listen("tcp", "0.0.0.0:8080")
 	if err != nil {
 		log.Fatal(err)
