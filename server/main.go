@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +39,7 @@ func Encode(body []byte) []byte {
 	return append(header, body...)
 }
 
-// 【修改】增加读超时参数，解决半开连接永久阻塞
+// Decode 增加读超时参数，解决半开连接永久阻塞
 func Decode(r io.Reader, timeout time.Duration) ([]byte, error) {
 	if conn, ok := r.(net.Conn); ok {
 		conn.SetReadDeadline(time.Now().Add(timeout))
@@ -57,7 +58,7 @@ func Decode(r io.Reader, timeout time.Duration) ([]byte, error) {
 	return bodyBuf, err
 }
 
-// 【修改】心跳检测增加写超时，防止Write阻塞
+// startHeartbeatChecker 心跳检测增加写超时，防止Write阻塞
 func startHeartbeatChecker() {
 	ticker := time.NewTicker(scanInterval)
 	defer ticker.Stop()
@@ -71,7 +72,6 @@ func startHeartbeatChecker() {
 			}
 		}
 		mu.Unlock()
-
 		for _, c := range toClose {
 			log.Println("⚠️ 连接心跳超时，关闭", c.RemoteAddr())
 			_ = c.SetWriteDeadline(time.Now().Add(1 * time.Second))
@@ -91,32 +91,39 @@ func initDB() error {
 	db.SetMaxIdleConns(5)
 	createSQL := `
 CREATE TABLE IF NOT EXISTS users (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	username TEXT UNIQUE NOT NULL,
-	password TEXT NOT NULL,
-	security_question TEXT,
-	security_answer TEXT
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    security_question TEXT,
+    security_answer TEXT
 );
 CREATE TABLE IF NOT EXISTS friends (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	userA TEXT NOT NULL,
-	userB TEXT NOT NULL,
-	UNIQUE(userA,userB)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    userA TEXT NOT NULL,
+    userB TEXT NOT NULL,
+    UNIQUE(userA,userB)
 );
 CREATE TABLE IF NOT EXISTS pending_friend (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	fromUser TEXT NOT NULL,
-	toUser TEXT NOT NULL,
-	createTime DATETIME DEFAULT CURRENT_TIMESTAMP,
-	UNIQUE(fromUser,toUser)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fromUser TEXT NOT NULL,
+    toUser TEXT NOT NULL,
+    createTime DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(fromUser,toUser)
 );
-CREATE TABLE IF NOT EXISTS offline_msg (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	sender TEXT NOT NULL,
-	receiver TEXT NOT NULL,
-	content TEXT NOT NULL,
-	createTime DATETIME DEFAULT CURRENT_TIMESTAMP
-);`
+CREATE TABLE IF NOT EXISTS private_msg (
+    msg_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender TEXT NOT NULL,
+    receiver TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status INTEGER DEFAULT 0, --0正常，1已撤回
+    createTime DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_read INTEGER DEFAULT 0, --0未读 1已读
+    FOREIGN KEY(sender) REFERENCES users(username),
+    FOREIGN KEY(receiver) REFERENCES users(username)
+);
+CREATE INDEX IF NOT EXISTS idx_private_sender ON private_msg(sender);
+CREATE INDEX IF NOT EXISTS idx_private_receiver ON private_msg(receiver);
+`
 	_, err = db.Exec(createSQL)
 	return err
 }
@@ -361,52 +368,126 @@ func isFriend(u1, u2 string) (bool, error) {
 	return cnt > 0, nil
 }
 
-func saveOfflineMsg(sender, receiver, content string) error {
-	_, err := db.Exec(`INSERT INTO offline_msg(sender,receiver,content) VALUES (?,?,?)`, sender, receiver, content)
-	return err
+// ========== 私聊消息持久化、撤回、历史记录、未读消息 ==========
+// savePrivateMsg 保存私聊消息，返回msgId
+func savePrivateMsg(sender, receiver, content string) (int64, error) {
+	res, err := db.Exec(`INSERT INTO private_msg(sender,receiver,content) VALUES (?,?,?)`, sender, receiver, content)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
-func fetchOfflineMsg(username string) ([]string, error) {
-	rows, err := db.Query(`SELECT sender,content,createTime FROM offline_msg WHERE receiver=?`, username)
+// recallPrivateMsg 撤回消息，校验发送者权限
+func recallPrivateMsg(msgId int64, operator string) (string, error) {
+	var sender string
+	err := db.QueryRow(`SELECT sender FROM private_msg WHERE msg_id=?`, msgId).Scan(&sender)
+	if err != nil {
+		return "❌ 消息不存在", nil
+	}
+	if sender != operator {
+		return "❌ 只有发送者可以撤回这条消息", nil
+	}
+	_, err = db.Exec(`UPDATE private_msg SET status=1 WHERE msg_id=?`, msgId)
+	if err != nil {
+		return "", err
+	}
+	return "✅ 消息撤回成功", nil
+}
+
+// getChatHistory 获取两人私聊历史记录
+func getChatHistory(userA, userB string) ([]string, error) {
+	rows, err := db.Query(`
+    SELECT msg_id,sender,content,status,createTime
+    FROM private_msg
+    WHERE (sender=? AND receiver=?) OR (sender=? AND receiver=?)
+    ORDER BY msg_id ASC
+    `, userA, userB, userB, userA)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []string
+	for rows.Next() {
+		var msgId int64
+		var sender, content, createTime string
+		var status int
+		err := rows.Scan(&msgId, &sender, &content, &status, &createTime)
+		if err != nil {
+			return nil, err
+		}
+		if status == 1 {
+			list = append(list, fmt.Sprintf("[%s]【%s】: 【消息已撤回】 msgId:%d", createTime, sender, msgId))
+		} else {
+			list = append(list, fmt.Sprintf("[%s]【%s】: %s | msgId:%d", createTime, sender, content, msgId))
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// fetchUnreadMsg 登录拉取未读私聊消息，拉取后标记已读
+func fetchUnreadMsg(username string) ([]string, error) {
+	rows, err := db.Query(`
+    SELECT msg_id,sender,content,status,createTime
+    FROM private_msg
+    WHERE receiver=? AND is_read=0
+    ORDER BY msg_id ASC
+    `, username)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var msgs []string
+	var msgIds []int64
 	for rows.Next() {
-		var sender, content, t string
-		rows.Scan(&sender, &content, &t)
-		msgs = append(msgs, fmt.Sprintf("【离线消息 %s】%s：%s", t, sender, content))
+		var msgId int64
+		var sender, content, createTime string
+		var status int
+		err := rows.Scan(&msgId, &sender, &content, &status, &createTime)
+		if err != nil {
+			return nil, err
+		}
+		msgIds = append(msgIds, msgId)
+		if status == 1 {
+			msgs = append(msgs, fmt.Sprintf("【离线消息 %s】【%s】:【消息已撤回】msgId:%d", createTime, sender, msgId))
+		} else {
+			msgs = append(msgs, fmt.Sprintf("【离线消息 %s】【%s】: %s | msgId:%d", createTime, sender, content, msgId))
+		}
 	}
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
-	_, err = db.Exec(`DELETE FROM offline_msg WHERE receiver=?`, username)
-	return msgs, err
+	// 批量标记为已读
+	for _, mid := range msgIds {
+		_, _ = db.Exec(`UPDATE private_msg SET is_read=1 WHERE msg_id=?`, mid)
+	}
+	return msgs, nil
 }
 
 func startChatLoop(conn net.Conn, username string) {
-	offlineMsgs, err := fetchOfflineMsg(username)
-	if err == nil && len(offlineMsgs) > 0 {
-		for _, m := range offlineMsgs {
+	// 登录拉取未读私聊消息
+	unreadMsgs, err := fetchUnreadMsg(username)
+	if err == nil && len(unreadMsgs) > 0 {
+		for _, m := range unreadMsgs {
 			_, _ = conn.Write(Encode([]byte(m)))
 		}
 	}
 	for {
-		// 【修改】传入读超时
 		body, err := Decode(conn, heartbeatTimeout)
 		if err != nil {
 			log.Println(username, "读取消息失败：", err)
 			return
 		}
 		content := strings.TrimSpace(string(body))
-		// 收到任何数据都更新活跃时间
+		// 更新活跃时间
 		mu.Lock()
 		if sess, ok := sessions[conn]; ok {
 			sess.lastActiveAt = time.Now()
 		}
 		mu.Unlock()
-
 		if content == "" {
 			continue
 		}
@@ -507,6 +588,65 @@ func startChatLoop(conn net.Conn, username string) {
 			}
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
+		// 撤回私聊消息
+		case strings.HasPrefix(content, "recall|"):
+			parts := strings.Split(content, "|")
+			if len(parts) != 2 {
+				resp = "❌撤回指令格式 recall|msgId"
+			} else {
+				msgId, err := strconv.ParseInt(parts[1], 10, 64)
+				if err != nil {
+					resp = "❌ msgId必须是数字"
+				} else {
+					retMsg, err := recallPrivateMsg(msgId, username)
+					if err != nil {
+						resp = "❌撤回数据库异常"
+					} else {
+						resp = retMsg
+						// 只有撤回成功，才推送撤回广播
+						if retMsg == "✅ 消息撤回成功" {
+							var receiver string
+							errScan := db.QueryRow(`SELECT receiver FROM private_msg WHERE msg_id=?`, msgId).Scan(&receiver)
+							if errScan == nil {
+								notifyText := fmt.Sprintf("🔔 一条消息被撤回 msgId:%d", msgId)
+								// 推送给接收方
+								if recvConn := getOnlineConn(receiver); recvConn != nil {
+									_, _ = recvConn.Write(Encode([]byte(notifyText)))
+								}
+								// 推送给撤回操作者本人
+								if selfConn := getOnlineConn(username); selfConn != nil {
+									_, _ = selfConn.Write(Encode([]byte(notifyText)))
+								}
+							}
+						}
+					}
+				}
+			}
+			_, _ = conn.Write(Encode([]byte(resp)))
+			continue
+		// 查询历史聊天记录
+		case strings.HasPrefix(content, "history|"):
+			parts := strings.Split(content, "|")
+			if len(parts) != 2 {
+				resp = "❌历史记录指令格式 history|好友名"
+			} else {
+				target := parts[1]
+				ok, err := isFriend(username, target)
+				if err != nil || !ok {
+					resp = "❌非好友不能查看历史记录"
+				} else {
+					historyList, err := getChatHistory(username, target)
+					if err != nil {
+						resp = "❌读取历史记录失败"
+					} else if len(historyList) == 0 {
+						resp = "📭暂无历史聊天记录"
+					} else {
+						resp = "📜历史聊天记录:\n" + strings.Join(historyList, "\n")
+					}
+				}
+			}
+			_, _ = conn.Write(Encode([]byte(resp)))
+			continue
 		case strings.HasPrefix(content, "@"):
 			rest := content[1:]
 			spaceIdx := strings.Index(rest, " ")
@@ -523,27 +663,32 @@ func startChatLoop(conn net.Conn, username string) {
 				_, _ = conn.Write(Encode([]byte(resp)))
 				continue
 			}
-			targetConn := getOnlineConn(targetName)
-			privateMsg := fmt.Sprintf("【私聊 %s->%s】%s", username, targetName, chatMsg)
-			log.Println(privateMsg)
-			if targetConn == nil {
-				err := saveOfflineMsg(username, targetName, chatMsg)
-				if err != nil {
-					resp = "❌ 保存离线消息失败"
-				} else {
-					resp = fmt.Sprintf("💤【%s】离线，消息已保存，上线自动推送", targetName)
-				}
+			// 保存私聊消息入库拿到msgId
+			msgId, err := savePrivateMsg(username, targetName, chatMsg)
+			if err != nil {
+				resp = "❌ 保存消息失败"
 			} else {
-				_, writeErr := targetConn.Write(Encode([]byte(privateMsg)))
-				if writeErr != nil {
-					resp = fmt.Sprintf("❌ 发给【%s】失败", targetName)
+				privateMsg := fmt.Sprintf("【私聊 %s->%s】%s | msgId:%d", username, targetName, chatMsg, msgId)
+				log.Println(privateMsg)
+				targetConn := getOnlineConn(targetName)
+				if targetConn == nil {
+					resp = fmt.Sprintf("💤【%s】离线，消息已保存，上线自动推送, msgId:%d", targetName, msgId)
 				} else {
-					resp = fmt.Sprintf("✅私聊发送成功")
+					// 发给接收方
+					_, writeErr := targetConn.Write(Encode([]byte(privateMsg)))
+					if writeErr != nil {
+						resp = fmt.Sprintf("❌ 发给【%s】失败", targetName)
+					} else {
+						resp = fmt.Sprintf("✅私聊发送成功 msgId:%d", msgId)
+					}
 				}
+				// ========== 修复：把消息回显给发送者自己 ==========
+				_, _ = conn.Write(Encode([]byte(privateMsg)))
 			}
 			_, _ = conn.Write(Encode([]byte(resp)))
 			continue
 		}
+		// 公共频道广播消息（不入库，不可撤回）
 		msg := fmt.Sprintf("【公共】【%s】: %s", username, content)
 		log.Println("公共消息：", msg)
 		mu.Lock()
@@ -571,7 +716,6 @@ func handleConn(conn net.Conn) {
 	}
 	sessions[conn] = sess
 	mu.Unlock()
-
 	defer func() {
 		mu.Lock()
 		delete(sessions, conn)
@@ -581,18 +725,16 @@ func handleConn(conn net.Conn) {
 	}()
 
 	for {
-		// 【修改】传入读超时
 		body, err := Decode(conn, heartbeatTimeout)
 		if err != nil {
 			log.Println("读取认证失败", err)
 			return
 		}
 		raw := strings.TrimSpace(string(body))
-		// 认证阶段也要更新心跳时间
+		// 认证阶段更新心跳
 		mu.Lock()
 		sess.lastActiveAt = time.Now()
 		mu.Unlock()
-
 		parts := strings.Split(raw, "|")
 		var resp string
 		if len(parts) >= 1 {
@@ -625,6 +767,7 @@ func handleConn(conn net.Conn) {
 				continue
 			}
 		}
+
 		if len(parts) != 3 {
 			resp = "❌ 格式：register|user|pass 或 login|user|pass，找回密码可用 getsecq|xxx / resetpwd|user|答案|新密码"
 			_, _ = conn.Write(Encode([]byte(resp)))
@@ -677,7 +820,7 @@ func handleConn(conn net.Conn) {
 		}
 		if loginSuccess {
 			mu.Lock()
-			// 【修改】单点登录踢旧连接，全部操作放锁内
+			// 单点登录踢旧连接
 			var oldConn net.Conn
 			for c, s := range sessions {
 				if s.username == username {
@@ -695,18 +838,8 @@ func handleConn(conn net.Conn) {
 			sess.username = username
 			sessions[conn] = sess
 			mu.Unlock()
-
-			helpText := `✅登录成功！
-指令列表：
-addfriend|xxx     添加好友xxx
-pendinglist       查看收到的好友申请
-acceptfriend|xxx  同意好友申请
-rejectfriend|xxx  拒绝好友申请
-friendlist        查看好友列表
-delfriend|xxx     删除好友
-setsecq|问题|答案 设置密保问题（用于找回密码）
-@xxx 消息内容     私聊好友
-直接输入文字 = 公共频道`
+			// 只返回登录成功，不再下发指令列表
+			helpText := `✅登录成功！`
 			_, _ = conn.Write(Encode([]byte(helpText)))
 			log.Printf("【%s】上线 %s", username, conn.RemoteAddr())
 			startChatLoop(conn, username)
@@ -723,7 +856,6 @@ func main() {
 	defer db.Close()
 	log.Println("✅ SQLite IM数据库加载成功")
 	go startHeartbeatChecker()
-
 	listener, err := net.Listen("tcp", "0.0.0.0:8080")
 	if err != nil {
 		log.Fatal(err)
