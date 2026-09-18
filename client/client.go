@@ -15,10 +15,15 @@ import (
 )
 
 const (
-	serverAddr        = "127.0.0.1:8080"
-	maxPacketSize     = 4096
-	heartbeatInterval = 3 * time.Second
-	heartbeatTimeout  = 10 * time.Second
+	serverAddr         = "127.0.0.1:8080"
+	maxPacketSize      = 4096
+	heartbeatInterval  = 3 * time.Second
+	heartbeatTimeout   = 10 * time.Second
+	maxDisplayMessages = 200
+	maxNicknameLen     = 20
+	minPasswordLen     = 3
+	maxPasswordLen     = 128
+	accountIDLength    = 10
 )
 
 // =========================
@@ -27,64 +32,41 @@ const (
 
 func Encode(body []byte) []byte {
 	header := make([]byte, 4)
-
-	binary.BigEndian.PutUint32(
-		header,
-		uint32(len(body)),
-	)
-
+	binary.BigEndian.PutUint32(header, uint32(len(body)))
 	return append(header, body...)
 }
 
 func Decode(r io.Reader) ([]byte, error) {
-
-	headerBuf := make([]byte, 4)
-
-	_, err := io.ReadFull(
-		r,
-		headerBuf,
-	)
-
-	if err != nil {
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(r, header); err != nil {
 		return nil, err
 	}
 
-	bodyLen := binary.BigEndian.Uint32(headerBuf)
-
+	bodyLen := binary.BigEndian.Uint32(header)
 	if bodyLen > maxPacketSize {
-		return nil, io.ErrShortBuffer
+		return nil, fmt.Errorf(
+			"packet too large: %d > %d",
+			bodyLen,
+			maxPacketSize,
+		)
 	}
 
-	bodyBuf := make([]byte, bodyLen)
-
-	_, err = io.ReadFull(
-		r,
-		bodyBuf,
-	)
-
-	if err != nil {
+	body := make([]byte, bodyLen)
+	if _, err := io.ReadFull(r, body); err != nil {
 		return nil, err
 	}
 
-	return bodyBuf, nil
+	return body, nil
 }
 
-// =========================
-// 消息 ID 提取
-// =========================
-
-func extractMsgId(text string) string {
+func extractMsgID(text string) string {
 	index := strings.Index(text, "msgId:")
-
 	if index == -1 {
 		return ""
 	}
 
 	rest := text[index+len("msgId:"):]
-
-	// 按空白字符分割
 	fields := strings.Fields(rest)
-
 	if len(fields) == 0 {
 		return ""
 	}
@@ -97,23 +79,15 @@ func extractMsgId(text string) string {
 // =========================
 
 func clearScreen() {
-
 	var cmd *exec.Cmd
 
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command(
-			"cmd",
-			"/c",
-			"cls",
-		)
+		cmd = exec.Command("cmd", "/c", "cls")
 	} else {
-		cmd = exec.Command(
-			"clear",
-		)
+		cmd = exec.Command("clear")
 	}
 
 	cmd.Stdout = os.Stdout
-
 	_ = cmd.Run()
 }
 
@@ -122,31 +96,38 @@ func clearScreen() {
 // =========================
 
 func printMenu() {
+	fmt.Println("====================== IM 聊天 ======================")
 
-	fmt.Println(
-		"====================== IM 聊天 ======================",
-	)
+	fmt.Println("【账号】")
+	fmt.Println("profile                  查看当前账号和昵称")
+	fmt.Println("changenick               修改昵称")
+	fmt.Println("changepwd                修改密码")
+	fmt.Println()
 
-	fmt.Println("【指令】")
-	fmt.Println("addfriend|xxx     添加好友xxx")
-	fmt.Println("pendinglist       查看收到的好友申请")
-	fmt.Println("acceptfriend|xxx  同意好友申请")
-	fmt.Println("rejectfriend|xxx  拒绝好友申请")
-	fmt.Println("friendlist        查看好友列表")
-	fmt.Println("delfriend|xxx     删除好友")
-	fmt.Println("setsecq|问题|答案 设置密保（用于找回密码！）")
-	fmt.Println("@xxx 消息内容     私聊好友（离线自动存消息）")
-	fmt.Println("recall|msgId      撤回私聊消息")
-	fmt.Println("history|xxx       查看和xxx好友历史聊天记录")
-	fmt.Println("直接打字 = 公共广播")
+	fmt.Println("【好友】")
+	fmt.Println("addfriend                添加好友（可选择ID或昵称）")
+	fmt.Println("pendinglist              查看收到的好友申请")
+	fmt.Println("acceptfriend|账号ID     同意好友申请")
+	fmt.Println("rejectfriend|账号ID     拒绝好友申请")
+	fmt.Println("friendlist               查看好友列表")
+	fmt.Println("delfriend|账号ID        删除好友")
+	fmt.Println("setsecq|问题|答案        设置密保")
+	fmt.Println()
 
-	fmt.Println(
-		"====================================================",
-	)
+	fmt.Println("【聊天】")
+	fmt.Println("@昵称 消息内容           私聊好友")
+	fmt.Println("recall|msgId             撤回私聊消息")
+	fmt.Println("history                  查看私聊历史记录（全部/精准检索）")
+	fmt.Println("history|账号ID|all       查看与好友的全部私聊记录")
+	fmt.Println("history|账号ID|time|开始|结束  按时间精准查询")
+	fmt.Println("history|账号ID|msgid|ID  按消息ID精准查询")
+	fmt.Println("直接打字                 公共广播")
+
+	fmt.Println("====================================================")
 }
 
 // =========================
-// 全局客户端状态
+// 全局状态
 // =========================
 
 var (
@@ -157,128 +138,167 @@ var (
 	pongMu sync.Mutex
 
 	lastPongAt = time.Now()
+
+	writeMu sync.Mutex
 )
 
 // =========================
-// 心跳时间
+// 心跳
 // =========================
 
 func setPong() {
-
 	pongMu.Lock()
-
 	lastPongAt = time.Now()
-
 	pongMu.Unlock()
 }
 
 func sincePong() time.Duration {
-
 	pongMu.Lock()
-
 	defer pongMu.Unlock()
 
 	return time.Since(lastPongAt)
 }
 
 // =========================
-// 添加消息
+// 消息显示
 // =========================
 
-func addMsg(msg string) {
-
+func redraw() {
 	msgMu.Lock()
-
-	msgList = append(
-		msgList,
-		msg,
-	)
-
-	// redraw 必须在锁里面读取 msgList
-	redrawLocked()
-
+	messages := append([]string(nil), msgList...)
 	msgMu.Unlock()
-}
-
-// =========================
-// 重绘
-// =========================
-
-// redrawLocked 要求调用者已经持有 msgMu
-func redrawLocked() {
 
 	clearScreen()
-
 	printMenu()
 
-	for _, m := range msgList {
-		fmt.Println(m)
+	for _, msg := range messages {
+		fmt.Println(msg)
 	}
 
 	fmt.Print("> ")
 }
 
-// =========================
-// 重绘安全封装
-// =========================
-
-func redraw() {
-
+func addMsg(msg string) {
 	msgMu.Lock()
 
-	redrawLocked()
+	msgList = append(msgList, msg)
+
+	if len(msgList) > maxDisplayMessages {
+		msgList = msgList[len(msgList)-maxDisplayMessages:]
+	}
 
 	msgMu.Unlock()
+
+	redraw()
 }
 
 // =========================
-// 发送消息
+// 发送
 // =========================
 
 func sendPacket(conn net.Conn, msg string) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
 
-	// 防止 Write 无限阻塞
-	_ = conn.SetWriteDeadline(
-		time.Now().Add(2 * time.Second),
-	)
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	defer conn.SetWriteDeadline(time.Time{})
 
-	_, err := conn.Write(
-		Encode([]byte(msg)),
-	)
-
-	// 恢复无限等待
-	_ = conn.SetWriteDeadline(time.Time{})
-
+	_, err := conn.Write(Encode([]byte(msg)))
 	return err
 }
 
 // =========================
-// 登录阶段读取响应
-// 自动跳过 pong
+// 输入校验
+// =========================
+
+func readLine(reader *bufio.Reader, prompt string) (string, error) {
+	fmt.Print(prompt)
+
+	text, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(text), nil
+}
+
+func validAccountIDLocal(accountID string) bool {
+	if len(accountID) != accountIDLength {
+		return false
+	}
+
+	if accountID == "0000000000" {
+		return false
+	}
+
+	for _, ch := range accountID {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validNicknameLocal(nickname string) error {
+	nickname = strings.TrimSpace(nickname)
+
+	if nickname == "" {
+		return fmt.Errorf("昵称不能为空")
+	}
+
+	if len([]rune(nickname)) > maxNicknameLen {
+		return fmt.Errorf("昵称不能超过%d个字符", maxNicknameLen)
+	}
+
+	if strings.ContainsAny(nickname, "|\r\n\t") {
+		return fmt.Errorf("昵称不能包含 | 或换行符")
+	}
+
+	return nil
+}
+
+func validPasswordLocal(password string) error {
+	if password == "" {
+		return fmt.Errorf("密码不能为空")
+	}
+
+	if len(password) < minPasswordLen {
+		return fmt.Errorf("密码至少%d位", minPasswordLen)
+	}
+
+	if len(password) > maxPasswordLen {
+		return fmt.Errorf("密码不能超过%d个字符", maxPasswordLen)
+	}
+
+	if strings.ContainsAny(password, "|\r\n\t") {
+		return fmt.Errorf("密码不能包含 | 或换行符")
+	}
+
+	return nil
+}
+
+func validSecurityAnswerLocal(answer string) bool {
+	return strings.TrimSpace(answer) != "" &&
+		!strings.ContainsAny(answer, "|\r\n\t")
+}
+
+// =========================
+// 登录阶段读取
 // =========================
 
 func readAuthResp(conn net.Conn) (string, bool) {
-
 	for {
-
 		body, err := Decode(conn)
-
 		if err != nil {
-
-			fmt.Printf(
-				"读取响应失败：%v\n",
-				err,
-			)
-
+			fmt.Printf("读取响应失败：%v\n", err)
 			return "", false
 		}
 
 		msg := string(body)
 
 		if msg == "pong" {
-
 			setPong()
-
 			continue
 		}
 
@@ -294,30 +314,17 @@ func startAuthKeepAlive(
 	conn net.Conn,
 	stop <-chan struct{},
 ) {
-
 	go func() {
-
-		ticker := time.NewTicker(
-			heartbeatInterval,
-		)
-
+		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 
 		for {
-
 			select {
-
 			case <-stop:
 				return
 
 			case <-ticker.C:
-
-				err := sendPacket(
-					conn,
-					"ping",
-				)
-
-				if err != nil {
+				if err := sendPacket(conn, "ping"); err != nil {
 					return
 				}
 			}
@@ -333,307 +340,408 @@ func authFlow(
 	conn net.Conn,
 	reader *bufio.Reader,
 ) bool {
-
 	for {
+		fmt.Println()
+		fmt.Println("请选择：1 注册账号  2 登录账号  3 找回密码")
 
-		fmt.Println(
-			"请选择：1注册账号  2登录账号  3找回密码",
-		)
-
-		fmt.Print(
+		choice, err := readLine(
+			reader,
 			"输入选择(1/2/3) > ",
 		)
-
-		choice, err :=
-			reader.ReadString('\n')
-
 		if err != nil {
 			return false
 		}
 
-		choice = strings.TrimSpace(
-			choice,
-		)
-
-		// =========================
-		// 找回密码
-		// =========================
-
-		if choice == "3" {
-
-			fmt.Println(
-				"\n=====密码找回=====",
-			)
-
-			fmt.Println(
-				"第一步：查询密保问题",
-			)
-
-			fmt.Print(
-				"要找回的用户名 > ",
-			)
-
-			user, err :=
-				reader.ReadString('\n')
-
-			if err != nil {
-				return false
+		switch choice {
+		case "1":
+			if registerFlow(conn, reader) {
+				return true
 			}
 
-			user = strings.TrimSpace(user)
-
-			if user == "" {
-
-				fmt.Println(
-					"❌ 用户名不能为空",
-				)
-
-				continue
+		case "2":
+			if loginFlow(conn, reader) {
+				return true
 			}
 
-			err = sendPacket(
-				conn,
-				"getsecq|"+user,
-			)
-
-			if err != nil {
-
-				fmt.Println(
-					"发送失败：",
-					err,
-				)
-
-				return false
+		case "3":
+			if !resetPasswordFlow(conn, reader) {
+				// 找回密码失败或者用户主动返回时继续主菜单。
 			}
 
-			respBody, ok :=
-				readAuthResp(conn)
-
-			if !ok {
-				return false
-			}
-
-			fmt.Println(respBody)
-
-			if strings.Contains(
-				respBody,
-				"❌",
-			) {
-				continue
-			}
-
-			fmt.Print(
-				"密保答案 > ",
-			)
-
-			ans, err :=
-				reader.ReadString('\n')
-
-			if err != nil {
-				return false
-			}
-
-			ans = strings.TrimSpace(ans)
-
-			fmt.Print(
-				"设置新密码 > ",
-			)
-
-			newPass, err :=
-				reader.ReadString('\n')
-
-			if err != nil {
-				return false
-			}
-
-			newPass = strings.TrimSpace(newPass)
-
-			if ans == "" ||
-				newPass == "" {
-
-				fmt.Println(
-					"❌ 密保答案和新密码不能为空",
-				)
-
-				continue
-			}
-
-			if strings.Contains(
-				ans,
-				"|",
-			) {
-
-				fmt.Println(
-					"❌ 密保答案不能包含 |",
-				)
-
-				continue
-			}
-
-			if len(newPass) < 3 {
-
-				fmt.Println(
-					"❌ 新密码至少3位",
-				)
-
-				continue
-			}
-
-			err = sendPacket(
-				conn,
-				"resetpwd|"+
-					user+
-					"|"+
-					ans+
-					"|"+
-					newPass,
-			)
-
-			if err != nil {
-
-				fmt.Println(
-					"发送失败：",
-					err,
-				)
-
-				return false
-			}
-
-			respReset, ok :=
-				readAuthResp(conn)
-
-			if !ok {
-				return false
-			}
-
-			fmt.Println(
-				respReset,
-			)
-
-			fmt.Println(
-				"找回密码流程结束，返回主菜单\n",
-			)
-
-			continue
-		}
-
-		// =========================
-		// 注册 / 登录
-		// =========================
-
-		if choice != "1" &&
-			choice != "2" {
-
-			fmt.Println(
-				"❌ 只能输入1、2或者3",
-			)
-
-			continue
-		}
-
-		fmt.Print(
-			"用户名 > ",
-		)
-
-		user, err :=
-			reader.ReadString('\n')
-
-		if err != nil {
-			return false
-		}
-
-		user = strings.TrimSpace(user)
-
-		fmt.Print(
-			"密码 > ",
-		)
-
-		pass, err :=
-			reader.ReadString('\n')
-
-		if err != nil {
-			return false
-		}
-
-		pass = strings.TrimSpace(pass)
-
-		if user == "" ||
-			pass == "" {
-
-			fmt.Println(
-				"❌ 用户名和密码不能为空",
-			)
-
-			continue
-		}
-
-		if strings.ContainsAny(
-			user,
-			" |\r\n\t",
-		) {
-
-			fmt.Println(
-				"❌ 用户名不能包含空格、| 或换行符",
-			)
-
-			continue
-		}
-
-		if len(pass) < 3 {
-
-			fmt.Println(
-				"❌ 密码至少3位",
-			)
-
-			continue
-		}
-
-		var action string
-
-		if choice == "1" {
-			action = "register"
-		} else {
-			action = "login"
-		}
-
-		err = sendPacket(
-			conn,
-			action+"|"+user+"|"+pass,
-		)
-
-		if err != nil {
-
-			fmt.Println(
-				"发送失败：",
-				err,
-			)
-
-			return false
-		}
-
-		respMsg, ok :=
-			readAuthResp(conn)
-
-		if !ok {
-			return false
-		}
-
-		fmt.Println(
-			respMsg,
-		)
-
-		if strings.Contains(
-			respMsg,
-			"注册成功",
-		) ||
-			strings.Contains(
-				respMsg,
-				"登录成功",
-			) {
-
-			return true
+		default:
+			fmt.Println("❌ 只能输入1、2或者3")
 		}
 	}
+}
+
+func registerFlow(
+	conn net.Conn,
+	reader *bufio.Reader,
+) bool {
+	fmt.Println("\n===== 注册账号 =====")
+
+	nickname, err := readLine(reader, "昵称 > ")
+	if err != nil {
+		return false
+	}
+
+	if err := validNicknameLocal(nickname); err != nil {
+		fmt.Println("❌", err)
+		return false
+	}
+
+	password, err := readLine(reader, "密码 > ")
+	if err != nil {
+		return false
+	}
+
+	if err := validPasswordLocal(password); err != nil {
+		fmt.Println("❌", err)
+		return false
+	}
+
+	if err := sendPacket(
+		conn,
+		"register|"+nickname+"|"+password,
+	); err != nil {
+		fmt.Println("发送失败：", err)
+		return false
+	}
+
+	resp, ok := readAuthResp(conn)
+	if !ok {
+		return false
+	}
+
+	fmt.Println(resp)
+
+	return strings.Contains(resp, "注册成功")
+}
+
+func loginFlow(
+	conn net.Conn,
+	reader *bufio.Reader,
+) bool {
+	fmt.Println("\n===== 登录账号 =====")
+
+	accountID, err := readLine(
+		reader,
+		"10位账号ID > ",
+	)
+	if err != nil {
+		return false
+	}
+
+	if !validAccountIDLocal(accountID) {
+		fmt.Println("❌ 账号ID必须是10位数字")
+		return false
+	}
+
+	password, err := readLine(reader, "密码 > ")
+	if err != nil {
+		return false
+	}
+
+	if err := validPasswordLocal(password); err != nil {
+		fmt.Println("❌", err)
+		return false
+	}
+
+	if err := sendPacket(
+		conn,
+		"login|"+accountID+"|"+password,
+	); err != nil {
+		fmt.Println("发送失败：", err)
+		return false
+	}
+
+	resp, ok := readAuthResp(conn)
+	if !ok {
+		return false
+	}
+
+	fmt.Println(resp)
+
+	return strings.Contains(resp, "登录成功")
+}
+
+func resetPasswordFlow(
+	conn net.Conn,
+	reader *bufio.Reader,
+) bool {
+	fmt.Println("\n===== 密码找回 =====")
+
+	accountID, err := readLine(
+		reader,
+		"账号ID > ",
+	)
+	if err != nil {
+		return false
+	}
+
+	if !validAccountIDLocal(accountID) {
+		fmt.Println("❌ 账号ID必须是10位数字")
+		return false
+	}
+
+	if err := sendPacket(
+		conn,
+		"getsecq|"+accountID,
+	); err != nil {
+		fmt.Println("发送失败：", err)
+		return false
+	}
+
+	resp, ok := readAuthResp(conn)
+	if !ok {
+		return false
+	}
+
+	fmt.Println(resp)
+
+	if strings.Contains(resp, "❌") {
+		return false
+	}
+
+	answer, err := readLine(
+		reader,
+		"密保答案 > ",
+	)
+	if err != nil {
+		return false
+	}
+
+	if !validSecurityAnswerLocal(answer) {
+		fmt.Println("❌ 密保答案不能为空，且不能包含 | 或换行符")
+		return false
+	}
+
+	newPassword, err := readLine(
+		reader,
+		"新密码 > ",
+	)
+	if err != nil {
+		return false
+	}
+
+	if err := validPasswordLocal(newPassword); err != nil {
+		fmt.Println("❌", err)
+		return false
+	}
+
+	if err := sendPacket(
+		conn,
+		"resetpwd|"+accountID+"|"+answer+"|"+newPassword,
+	); err != nil {
+		fmt.Println("发送失败：", err)
+		return false
+	}
+
+	resp, ok = readAuthResp(conn)
+	if !ok {
+		return false
+	}
+
+	fmt.Println(resp)
+	fmt.Println("密码找回流程结束，返回主菜单")
+
+	return false
+}
+
+// =========================
+// 已登录本地命令
+// =========================
+
+func handleLocalCommand(
+	conn net.Conn,
+	reader *bufio.Reader,
+	text string,
+) (handled bool, shouldExit bool) {
+	switch text {
+	case "addfriend":
+		fmt.Println("===== 添加好友 =====")
+		method, err := readLine(
+			reader,
+			"选择添加方式（1=账号ID，2=昵称） > ",
+		)
+		if err != nil {
+			return true, true
+		}
+
+		switch method {
+		case "1":
+			targetID, err := readLine(reader, "好友账号ID > ")
+			if err != nil {
+				return true, true
+			}
+			if !validAccountIDLocal(targetID) {
+				addMsg("❌ 账号ID必须是10位数字，且不能为0000000000")
+				return true, false
+			}
+
+			if err := sendPacket(
+				conn,
+				"addfriend|id|"+targetID,
+			); err != nil {
+				addMsg("❌ 添加好友请求发送失败：" + err.Error())
+				return true, true
+			}
+			return true, false
+
+		case "2":
+			targetNickname, err := readLine(reader, "好友昵称 > ")
+			if err != nil {
+				return true, true
+			}
+			if err := validNicknameLocal(targetNickname); err != nil {
+				addMsg("❌ " + err.Error())
+				return true, false
+			}
+
+			if err := sendPacket(
+				conn,
+				"addfriend|nick|"+targetNickname,
+			); err != nil {
+				addMsg("❌ 添加好友请求发送失败：" + err.Error())
+				return true, true
+			}
+			return true, false
+
+		default:
+			addMsg("❌ 只能输入1或2")
+			return true, false
+		}
+
+	case "changenick":
+		newNickname, err := readLine(
+			reader,
+			"新昵称 > ",
+		)
+		if err != nil {
+			return true, true
+		}
+
+		if err := validNicknameLocal(newNickname); err != nil {
+			addMsg("❌ " + err.Error())
+			return true, false
+		}
+
+		if err := sendPacket(
+			conn,
+			"changenick|"+newNickname,
+		); err != nil {
+			addMsg("❌ 修改昵称请求发送失败：" + err.Error())
+			return true, true
+		}
+
+		return true, false
+
+	case "history":
+		fmt.Println("===== 私聊历史记录 =====")
+		targetID, err := readLine(reader, "好友账号ID > ")
+		if err != nil {
+			return true, true
+		}
+		if !validAccountIDLocal(targetID) {
+			addMsg("❌ 账号ID必须是10位数字，且不能为0000000000")
+			return true, false
+		}
+
+		fmt.Println("请选择查询方式：")
+		fmt.Println("1. 全部查看")
+		fmt.Println("2. 按时间精准查询")
+		fmt.Println("3. 按消息ID精准查询")
+
+		method, err := readLine(reader, "选择(1/2/3) > ")
+		if err != nil {
+			return true, true
+		}
+
+		switch method {
+		case "1":
+			if err := sendPacket(conn, "history|"+targetID+"|all"); err != nil {
+				addMsg("❌ 历史记录查询发送失败：" + err.Error())
+				return true, true
+			}
+
+		case "2":
+			startTime, err := readLine(reader, "开始日期（YYYY-MM-DD）> ")
+			if err != nil {
+				return true, true
+			}
+			endTime, err := readLine(reader, "结束日期（YYYY-MM-DD）> ")
+			if err != nil {
+				return true, true
+			}
+			if err := sendPacket(
+				conn,
+				"history|"+targetID+"|time|"+startTime+"|"+endTime,
+			); err != nil {
+				addMsg("❌ 历史记录查询发送失败：" + err.Error())
+				return true, true
+			}
+
+		case "3":
+			msgID, err := readLine(reader, "消息ID > ")
+			if err != nil {
+				return true, true
+			}
+			if msgID == "" {
+				addMsg("❌ 消息ID不能为空")
+				return true, false
+			}
+			if err := sendPacket(
+				conn,
+				"history|"+targetID+"|msgid|"+msgID,
+			); err != nil {
+				addMsg("❌ 历史记录查询发送失败：" + err.Error())
+				return true, true
+			}
+
+		default:
+			addMsg("❌ 只能输入1、2或3")
+		}
+		return true, false
+
+	case "changepwd":
+		oldPassword, err := readLine(
+			reader,
+			"旧密码 > ",
+		)
+		if err != nil {
+			return true, true
+		}
+
+		newPassword, err := readLine(
+			reader,
+			"新密码 > ",
+		)
+		if err != nil {
+			return true, true
+		}
+
+		if err := validPasswordLocal(oldPassword); err != nil {
+			addMsg("❌ 旧密码：" + err.Error())
+			return true, false
+		}
+
+		if err := validPasswordLocal(newPassword); err != nil {
+			addMsg("❌ 新密码：" + err.Error())
+			return true, false
+		}
+
+		if err := sendPacket(
+			conn,
+			"changepwd|"+oldPassword+"|"+newPassword,
+		); err != nil {
+			addMsg("❌ 修改密码请求发送失败：" + err.Error())
+			return true, true
+		}
+
+		return true, false
+	}
+
+	return false, false
 }
 
 // =========================
@@ -641,88 +749,49 @@ func authFlow(
 // =========================
 
 func startReader(conn net.Conn) {
-
 	go func() {
-
 		for {
-
-			body, err :=
-				Decode(conn)
-
+			body, err := Decode(conn)
 			if err != nil {
-
-				addMsg(
-					"\n⚠️ 连接断开",
-				)
-
+				addMsg("\n⚠️ 连接断开")
 				return
 			}
 
 			msg := string(body)
 
-			// =========================
-			// pong
-			// =========================
-
 			if msg == "pong" {
-
 				setPong()
-
 				continue
 			}
-
-			// =========================
-			// 撤回通知
-			// =========================
 
 			if strings.HasPrefix(
 				msg,
 				"🔔 一条消息被撤回 msgId:",
 			) {
+				recallMsgID := extractMsgID(msg)
 
-				recallMsgId :=
-					extractMsgId(msg)
-
-				if recallMsgId == "" {
-
-					addMsg(
-						"⚠️ 收到非法撤回通知",
-					)
-
+				if recallMsgID == "" {
+					addMsg("⚠️ 收到非法撤回通知")
 					continue
 				}
 
 				msgMu.Lock()
 
 				for i := range msgList {
-
-					mid :=
-						extractMsgId(
-							msgList[i],
+					if extractMsgID(msgList[i]) == recallMsgID {
+						msgList[i] = fmt.Sprintf(
+							"【消息已撤回】msgId:%s",
+							recallMsgID,
 						)
-
-					if mid == recallMsgId {
-
-						msgList[i] =
-							fmt.Sprintf(
-								"【消息已撤回】msgId:%s",
-								recallMsgId,
-							)
-
 						break
 					}
 				}
 
-				redrawLocked()
-
 				msgMu.Unlock()
 
+				redraw()
 				continue
 			}
-
-			// =========================
-			// 普通消息
-			// =========================
 
 			addMsg(msg)
 		}
@@ -730,49 +799,24 @@ func startReader(conn net.Conn) {
 }
 
 // =========================
-// 心跳
+// 正式心跳
 // =========================
 
-func startHeartbeat(
-	conn net.Conn,
-) {
-
+func startHeartbeat(conn net.Conn) {
 	go func() {
-
-		ticker := time.NewTicker(
-			heartbeatInterval,
-		)
-
+		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 
 		for range ticker.C {
-
-			// 超过10秒没收到 pong
-			if sincePong() >
-				heartbeatTimeout {
-
-				addMsg(
-					"\n⚠️ 心跳超时，连接断开",
-				)
-
+			if sincePong() > heartbeatTimeout {
+				addMsg("\n⚠️ 心跳超时，连接断开")
 				_ = conn.Close()
-
 				return
 			}
 
-			err := sendPacket(
-				conn,
-				"ping",
-			)
-
-			if err != nil {
-
-				addMsg(
-					"\n⚠️ 心跳发送失败，连接断开",
-				)
-
+			if err := sendPacket(conn, "ping"); err != nil {
+				addMsg("\n⚠️ 心跳发送失败，连接断开")
 				_ = conn.Close()
-
 				return
 			}
 		}
@@ -780,144 +824,63 @@ func startHeartbeat(
 }
 
 // =========================
-// 主程序
+// main
 // =========================
 
 func main() {
+	fmt.Println("正在连接 IM 服务...")
 
-	fmt.Println(
-		"正在连接 IM 服务...",
-	)
-
-	conn, err :=
-		net.Dial(
-			"tcp",
-			serverAddr,
-		)
-
+	conn, err := net.Dial("tcp", serverAddr)
 	if err != nil {
-
-		fmt.Println(
-			"连接服务失败：",
-			err,
-		)
-
+		fmt.Println("连接服务失败：", err)
 		return
 	}
-
 	defer conn.Close()
 
-	fmt.Println(
-		"✅ 成功连接IM服务",
-	)
+	fmt.Println("✅ 成功连接 IM 服务")
 
-	// 整个程序只创建一个 Reader
-	reader :=
-		bufio.NewReader(
-			os.Stdin,
-		)
+	reader := bufio.NewReader(os.Stdin)
 
-	// =========================
-	// 登录阶段心跳
-	// =========================
+	stopAuthKeepAlive := make(chan struct{})
+	startAuthKeepAlive(conn, stopAuthKeepAlive)
 
-	stopAuthKeepAlive :=
-		make(chan struct{})
-
-	startAuthKeepAlive(
-		conn,
-		stopAuthKeepAlive,
-	)
-
-	// =========================
-	// 登录
-	// =========================
-
-	if !authFlow(
-		conn,
-		reader,
-	) {
-
-		close(
-			stopAuthKeepAlive,
-		)
-
-		fmt.Println(
-			"⚠️ 认证失败或连接断开",
-		)
-
+	if !authFlow(conn, reader) {
+		close(stopAuthKeepAlive)
+		fmt.Println("⚠️ 认证失败或连接断开")
 		return
 	}
 
-	close(
-		stopAuthKeepAlive,
-	)
-
-	// =========================
-	// 登录成功后重新计算心跳时间
-	// =========================
-
+	close(stopAuthKeepAlive)
 	setPong()
 
-	// =========================
-	// 初始界面
-	// =========================
-
-	msgMu.Lock()
-
-	redrawLocked()
-
-	msgMu.Unlock()
-
-	// =========================
-	// 启动接收消息
-	// =========================
-
+	redraw()
 	startReader(conn)
-
-	// =========================
-	// 启动正式心跳
-	// =========================
-
 	startHeartbeat(conn)
 
-	// =========================
-	// 主输入循环
-	// =========================
-
 	for {
-
-		text, err :=
-			reader.ReadString('\n')
-
+		text, err := readLine(reader, "")
 		if err != nil {
-
-			fmt.Println(
-				"\n⚠️ 输入读取失败：",
-				err,
-			)
-
+			fmt.Println("\n⚠️ 输入读取失败：", err)
 			return
 		}
-
-		text =
-			strings.TrimSpace(text)
 
 		if text == "" {
 			continue
 		}
 
-		err = sendPacket(
+		if handled, shouldExit := handleLocalCommand(
 			conn,
+			reader,
 			text,
-		)
+		); handled {
+			if shouldExit {
+				return
+			}
+			continue
+		}
 
-		if err != nil {
-
-			addMsg(
-				"消息发送失败：" + err.Error(),
-			)
-
+		if err := sendPacket(conn, text); err != nil {
+			addMsg("消息发送失败：" + err.Error())
 			return
 		}
 	}
